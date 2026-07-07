@@ -1,5 +1,9 @@
 import db from "@/lib/supabase/db";
-import { address, orderLines, orders, products } from "@/lib/supabase/schema";
+import { address, orders } from "@/lib/supabase/schema";
+import {
+  fetchVeloOrderLineRows,
+  groupVeloOrderLines,
+} from "@/lib/integrations/velo-order-lines";
 import {
   resolveVeloApiKey,
   touchVeloApiKeyUsage,
@@ -132,17 +136,7 @@ export async function GET(request: NextRequest) {
     .filter((id): id is string => Boolean(id));
 
   const [lineRows, addressRows] = await Promise.all([
-    db
-      .select({
-        orderId: orderLines.orderId,
-        productId: orderLines.productId,
-        quantity: orderLines.quantity,
-        price: orderLines.price,
-        productName: products.name,
-      })
-      .from(orderLines)
-      .leftJoin(products, eq(orderLines.productId, products.id))
-      .where(inArray(orderLines.orderId, orderIds)),
+    fetchVeloOrderLineRows(orderIds),
     addressIds.length
       ? db
           .select({
@@ -159,12 +153,7 @@ export async function GET(request: NextRequest) {
       : Promise.resolve([]),
   ]);
 
-  const linesByOrder = new Map<string, typeof lineRows>();
-  lineRows.forEach((line) => {
-    const current = linesByOrder.get(line.orderId) ?? [];
-    current.push(line);
-    linesByOrder.set(line.orderId, current);
-  });
+  const linesByOrder = groupVeloOrderLines(lineRows);
 
   const addressById = new Map(addressRows.map((row) => [row.id, row]));
 
@@ -186,9 +175,11 @@ export async function GET(request: NextRequest) {
     address: row.addressId ? addressById.get(row.addressId) ?? null : null,
     items: (linesByOrder.get(row.id) ?? []).map((line) => ({
       productId: line.productId,
-      productName: line.productName ?? null,
+      productName: line.productName,
+      productCode: line.productCode,
       quantity: line.quantity,
-      unitPrice: Number(line.price),
+      unitPrice: line.unitPrice,
+      imageUrl: line.imageUrl,
     })),
   }));
 
