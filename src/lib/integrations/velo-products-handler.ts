@@ -13,7 +13,7 @@ import {
   productMedias,
   products,
 } from "@/lib/supabase/schema";
-import { slugify } from "@/lib/utils";
+import { keytoUrl, slugify } from "@/lib/utils";
 import { and, asc, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 import sharp from "sharp";
 import { z } from "zod";
@@ -605,9 +605,11 @@ async function handleList(
         collectionId: products.collectionId,
         collectionLabel: collections.label,
         createdAt: products.createdAt,
+        imageKey: medias.key,
       })
       .from(products)
       .leftJoin(collections, eq(products.collectionId, collections.id))
+      .leftJoin(medias, eq(products.featuredImageId, medias.id))
       .where(whereClause)
       .orderBy(desc(products.createdAt))
       .limit(pageSize)
@@ -638,6 +640,7 @@ async function handleList(
       stock: row.stock,
       isDraft: row.isDraft,
       sizeConfig: sizeConfigs.get(row.id) ?? { enabled: false, options: [] },
+      imageUrl: row.imageKey ? keytoUrl(row.imageKey) : null,
       updatedAt: row.createdAt,
     })),
     page,

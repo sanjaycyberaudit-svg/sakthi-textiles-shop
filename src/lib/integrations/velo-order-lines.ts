@@ -50,7 +50,7 @@ export function mapVeloOrderLineItem(row: LineRow): VeloOrderLineItem {
     productCode: row.productCode ?? null,
     quantity: row.quantity,
     unitPrice: Number(row.price),
-    imageUrl: keytoUrl(row.imageKey ?? undefined),
+    imageUrl: row.imageKey ? keytoUrl(row.imageKey) : "",
   };
 }
 
