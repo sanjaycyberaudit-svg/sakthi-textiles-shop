@@ -1,7 +1,7 @@
 import db from "@/lib/supabase/db";
-import { medias, orderLines, products } from "@/lib/supabase/schema";
+import { orderLines, products } from "@/lib/supabase/schema";
 import { eq, inArray } from "drizzle-orm";
-import { keytoUrl } from "@/lib/utils";
+import { resolveProductImageUrls } from "./velo-product-images";
 
 export type VeloOrderLineItem = {
   productId: string;
@@ -19,15 +19,14 @@ type LineRow = {
   price: string;
   productName: string | null;
   productCode: string | null;
-  imageKey: string | null;
 };
 
 export async function fetchVeloOrderLineRows(
-  orderIds: string[],
-): Promise<LineRow[]> {
+  orderIds: string[]
+): Promise<(LineRow & { imageUrl: string })[]> {
   if (!orderIds.length) return [];
 
-  return db
+  const rows = await db
     .select({
       orderId: orderLines.orderId,
       productId: orderLines.productId,
@@ -35,26 +34,37 @@ export async function fetchVeloOrderLineRows(
       price: orderLines.price,
       productName: products.name,
       productCode: products.productCode,
-      imageKey: medias.key,
     })
     .from(orderLines)
     .leftJoin(products, eq(orderLines.productId, products.id))
-    .leftJoin(medias, eq(products.featuredImageId, medias.id))
     .where(inArray(orderLines.orderId, orderIds));
+
+  const imageByProductId = await resolveProductImageUrls(
+    rows.map((r) => r.productId)
+  );
+
+  return rows.map((row) => ({
+    ...row,
+    imageUrl: imageByProductId.get(row.productId) ?? "",
+  }));
 }
 
-export function mapVeloOrderLineItem(row: LineRow): VeloOrderLineItem {
+export function mapVeloOrderLineItem(
+  row: LineRow & { imageUrl: string }
+): VeloOrderLineItem {
   return {
     productId: row.productId,
     productName: row.productName ?? null,
     productCode: row.productCode ?? null,
     quantity: row.quantity,
     unitPrice: Number(row.price),
-    imageUrl: row.imageKey ? keytoUrl(row.imageKey) : "",
+    imageUrl: row.imageUrl || "",
   };
 }
 
-export function groupVeloOrderLines(rows: LineRow[]): Map<string, VeloOrderLineItem[]> {
+export function groupVeloOrderLines(
+  rows: (LineRow & { imageUrl: string })[]
+): Map<string, VeloOrderLineItem[]> {
   const map = new Map<string, VeloOrderLineItem[]>();
   for (const row of rows) {
     const current = map.get(row.orderId) ?? [];

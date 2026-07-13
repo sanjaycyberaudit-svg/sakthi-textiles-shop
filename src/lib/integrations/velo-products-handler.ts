@@ -13,7 +13,8 @@ import {
   productMedias,
   products,
 } from "@/lib/supabase/schema";
-import { keytoUrl, slugify } from "@/lib/utils";
+import { resolveProductImageUrls } from "./velo-product-images";
+import { slugify } from "@/lib/utils";
 import { and, asc, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
 import sharp from "sharp";
 import { z } from "zod";
@@ -585,8 +586,16 @@ async function handleList(
 
   const filters = [];
   if (search.trim()) {
-    const q = `%${search.trim()}%`;
-    filters.push(or(ilike(products.name, q), ilike(products.productCode, q)));
+    const raw = search.trim();
+    const q = `%${raw}%`;
+    // Include product id so packing can resolve draft/archived items by id.
+    filters.push(
+      or(
+        ilike(products.name, q),
+        ilike(products.productCode, q),
+        eq(products.id, raw)
+      )
+    );
   }
   if (draft === "draft") filters.push(eq(products.isDraft, true));
   if (draft === "published") filters.push(eq(products.isDraft, false));
@@ -605,11 +614,9 @@ async function handleList(
         collectionId: products.collectionId,
         collectionLabel: collections.label,
         createdAt: products.createdAt,
-        imageKey: medias.key,
       })
       .from(products)
       .leftJoin(collections, eq(products.collectionId, collections.id))
-      .leftJoin(medias, eq(products.featuredImageId, medias.id))
       .where(whereClause)
       .orderBy(desc(products.createdAt))
       .limit(pageSize)
@@ -620,9 +627,10 @@ async function handleList(
       .where(whereClause),
   ]);
   const productIds = rows.map((row) => row.id);
-  const [externalByProductId, sizeConfigs] = await Promise.all([
+  const [externalByProductId, sizeConfigs, imageByProductId] = await Promise.all([
     getExternalIdsForProductIds(productIds),
     getProductSizeConfigsByProductIds(productIds),
+    resolveProductImageUrls(productIds),
   ]);
 
   return {
@@ -640,7 +648,7 @@ async function handleList(
       stock: row.stock,
       isDraft: row.isDraft,
       sizeConfig: sizeConfigs.get(row.id) ?? { enabled: false, options: [] },
-      imageUrl: row.imageKey ? keytoUrl(row.imageKey) : null,
+      imageUrl: imageByProductId.get(row.id) ?? null,
       updatedAt: row.createdAt,
     })),
     page,
