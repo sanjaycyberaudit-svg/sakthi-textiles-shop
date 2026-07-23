@@ -3,6 +3,7 @@ import {
   normalizeProductSizeConfig,
   upsertProductSizeConfig,
 } from "@/lib/products/sizeConfig";
+import { invalidateStorefrontCache } from "@/lib/cache/invalidate-storefront";
 import { uploadMediaToSupabase } from "@/lib/storage/uploadMedia";
 import db from "@/lib/supabase/db";
 import {
@@ -14,8 +15,9 @@ import {
   products,
 } from "@/lib/supabase/schema";
 import { resolveProductImageUrls } from "./velo-product-images";
-import { slugify } from "@/lib/utils";
-import { and, asc, desc, eq, ilike, inArray, or, sql } from "drizzle-orm";
+import { keytoUrl, slugify } from "@/lib/utils";
+import { and, asc, desc, eq, ilike, inArray, ne, or, sql } from "drizzle-orm";
+import { revalidatePath } from "next/cache";
 import sharp from "sharp";
 import { z } from "zod";
 
@@ -149,11 +151,56 @@ export type VeloProductsAction =
   | "bulk_upsert"
   | "delete"
   | "meta"
-  | "resolveImages";
+  | "resolveImages"
+  | "upsertCollection";
 
 const resolveImagesDataSchema = z.object({
   productIds: z.array(z.string().trim().min(1)).min(1).max(100),
 });
+
+const upsertCollectionDataSchema = z.object({
+  id: z.string().trim().min(1).optional(),
+  name: z.string().trim().min(1),
+  description: z.string().trim().min(1),
+  featuredImageMediaId: z.string().trim().min(1).optional(),
+  imageBase64: z.string().optional(),
+  imageFileName: z.string().optional(),
+});
+
+function collectionNameToSlug(name: string) {
+  return slugify(name.trim()) || "category";
+}
+
+async function buildUniqueCollectionSlug(name: string, excludeId?: string) {
+  const base = collectionNameToSlug(name);
+  let candidate = base;
+  let suffix = 2;
+
+  while (true) {
+    const existing = await db
+      .select({ id: collections.id })
+      .from(collections)
+      .where(
+        excludeId
+          ? and(eq(collections.slug, candidate), ne(collections.id, excludeId))
+          : eq(collections.slug, candidate),
+      )
+      .limit(1);
+
+    if (existing.length === 0) return candidate;
+
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+}
+
+async function revalidateCollectionPages() {
+  revalidatePath("/collections");
+  revalidatePath("/collections", "layout");
+  revalidatePath("/shop");
+  revalidatePath("/admin/collections");
+  await invalidateStorefrontCache();
+}
 
 export type VeloProductsRequest = {
   action: VeloProductsAction;
@@ -547,6 +594,9 @@ export async function handleVeloProductsRequest(
       case "resolveImages":
         response = await handleResolveImages(requestId, body.data);
         break;
+      case "upsertCollection":
+        response = await handleUpsertCollection(requestId, body.data);
+        break;
       default:
         response = {
           ok: false,
@@ -893,17 +943,179 @@ async function handleMeta(
       id: collections.id,
       label: collections.label,
       slug: collections.slug,
+      description: collections.description,
+      featuredImageId: collections.featuredImageId,
+      mediaKey: medias.key,
     })
     .from(collections)
+    .leftJoin(medias, eq(collections.featuredImageId, medias.id))
     .orderBy(asc(collections.label));
 
   return {
     ok: true,
     requestId,
     action: "meta",
-    collections: rows,
+    collections: rows.map((row) => ({
+      id: row.id,
+      label: row.label,
+      slug: row.slug,
+      description: row.description,
+      featuredImageId: row.featuredImageId,
+      imageUrl: row.mediaKey ? keytoUrl(row.mediaKey) : null,
+    })),
     badges: ["new_product", "best_sale", "featured"],
     defaultSizes: DEFAULT_SIZES,
+  };
+}
+
+async function handleUpsertCollection(
+  requestId: string,
+  data: Record<string, unknown>,
+): Promise<VeloProductsResponse> {
+  const parsed = upsertCollectionDataSchema.safeParse(data);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      requestId,
+      action: "upsertCollection",
+      message: "Invalid category payload.",
+      errors: parsed.error.issues.map((issue) => issue.message),
+    };
+  }
+
+  const name = parsed.data.name.trim();
+  const description = parsed.data.description.trim();
+  const existingId = parsed.data.id?.trim();
+
+  let featuredImageId: string;
+  try {
+    if (existingId && !parsed.data.imageBase64 && !parsed.data.featuredImageMediaId) {
+      const [existing] = await db
+        .select({ featuredImageId: collections.featuredImageId })
+        .from(collections)
+        .where(eq(collections.id, existingId))
+        .limit(1);
+      if (!existing) {
+        return {
+          ok: false,
+          requestId,
+          action: "upsertCollection",
+          message: "Category not found.",
+          errors: ["Category not found."],
+        };
+      }
+      featuredImageId = existing.featuredImageId;
+    } else if (!parsed.data.featuredImageMediaId && !parsed.data.imageBase64) {
+      return {
+        ok: false,
+        requestId,
+        action: "upsertCollection",
+        message: "Category image is required.",
+        errors: ["Category image is required."],
+      };
+    } else {
+      featuredImageId = await resolveMediaId(
+        parsed.data.featuredImageMediaId,
+        parsed.data.imageBase64,
+        parsed.data.imageFileName || "category.jpg",
+      );
+    }
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Category image is required.";
+    return {
+      ok: false,
+      requestId,
+      action: "upsertCollection",
+      message,
+      errors: [message],
+    };
+  }
+
+  if (existingId) {
+    const [existing] = await db
+      .select({ id: collections.id })
+      .from(collections)
+      .where(eq(collections.id, existingId))
+      .limit(1);
+    if (!existing) {
+      return {
+        ok: false,
+        requestId,
+        action: "upsertCollection",
+        message: "Category not found.",
+        errors: ["Category not found."],
+      };
+    }
+
+    const slug = await buildUniqueCollectionSlug(name, existingId);
+    await db
+      .update(collections)
+      .set({
+        slug,
+        label: name,
+        title: name,
+        description,
+        featuredImageId,
+      })
+      .where(eq(collections.id, existingId));
+    await revalidateCollectionPages();
+
+    const [media] = await db
+      .select({ key: medias.key })
+      .from(medias)
+      .where(eq(medias.id, featuredImageId))
+      .limit(1);
+
+    return {
+      ok: true,
+      requestId,
+      action: "upsertCollection",
+      message: "Category updated.",
+      collection: {
+        id: existingId,
+        label: name,
+        slug,
+        description,
+        featuredImageId,
+        imageUrl: media?.key ? keytoUrl(media.key) : null,
+      },
+    };
+  }
+
+  const slug = await buildUniqueCollectionSlug(name);
+  const [created] = await db
+    .insert(collections)
+    .values({
+      slug,
+      label: name,
+      title: name,
+      description,
+      featuredImageId,
+    })
+    .returning({ id: collections.id });
+
+  await revalidateCollectionPages();
+
+  const [media] = await db
+    .select({ key: medias.key })
+    .from(medias)
+    .where(eq(medias.id, featuredImageId))
+    .limit(1);
+
+  return {
+    ok: true,
+    requestId,
+    action: "upsertCollection",
+    message: "Category created.",
+    collection: {
+      id: created.id,
+      label: name,
+      slug,
+      description,
+      featuredImageId,
+      imageUrl: media?.key ? keytoUrl(media.key) : null,
+    },
   };
 }
 
