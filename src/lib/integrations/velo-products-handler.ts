@@ -974,12 +974,15 @@ async function handleUpsertCollection(
 ): Promise<VeloProductsResponse> {
   const parsed = upsertCollectionDataSchema.safeParse(data);
   if (!parsed.success) {
+    const parseError = parsed as z.SafeParseError<
+      z.infer<typeof upsertCollectionDataSchema>
+    >;
     return {
       ok: false,
       requestId,
       action: "upsertCollection",
       message: "Invalid category payload.",
-      errors: parsed.error.issues.map((issue) => issue.message),
+      errors: parseError.error.issues.map((issue) => issue.message),
     };
   }
 
