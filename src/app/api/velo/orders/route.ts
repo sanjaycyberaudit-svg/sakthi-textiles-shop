@@ -8,7 +8,7 @@ import {
   resolveVeloApiKey,
   touchVeloApiKeyUsage,
 } from "@/lib/integrations/velo";
-import { and, asc, gt, inArray, ne, type SQL } from "drizzle-orm";
+import { and, asc, desc, gt, inArray, lt, ne, type SQL } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 
 const DEFAULT_LIMIT = 50;
@@ -108,17 +108,37 @@ export async function GET(request: NextRequest) {
     createdAfterDate = parsed;
   }
 
+  // Optional upper bound for newest-first (sort=desc) pagination.
+  const beforeRaw = searchParams.get("before");
+  let createdBeforeDate: Date | null = null;
+  if (beforeRaw) {
+    const parsed = new Date(beforeRaw);
+    if (Number.isNaN(parsed.getTime())) {
+      return NextResponse.json(
+        { message: "Invalid `before` format. Use ISO datetime." },
+        { status: 400, headers: veloCorsHeaders(request) },
+      );
+    }
+    createdBeforeDate = parsed;
+  }
+
+  const sortDesc = searchParams.get("sort")?.trim().toLowerCase() === "desc";
+
   // Default: all valid payment statuses. Optional paymentStatus narrows the set.
   const paymentFilter: SQL = inArray(orders.payment_status, paymentStatuses);
   const activeOrderFilter = ne(orders.order_status, "cancelled");
 
-  const whereClause = createdAfterDate
-    ? and(
-        paymentFilter,
-        activeOrderFilter,
-        gt(orders.createdAt, createdAfterDate),
-      )
-    : and(paymentFilter, activeOrderFilter);
+  const timeFilters: SQL[] = [];
+  if (createdAfterDate) timeFilters.push(gt(orders.createdAt, createdAfterDate));
+  if (createdBeforeDate) {
+    timeFilters.push(lt(orders.createdAt, createdBeforeDate));
+  }
+
+  const whereClause = and(
+    paymentFilter,
+    activeOrderFilter,
+    ...timeFilters,
+  );
 
   const orderRows = await db
     .select({
@@ -138,7 +158,7 @@ export async function GET(request: NextRequest) {
     })
     .from(orders)
     .where(whereClause)
-    .orderBy(asc(orders.createdAt))
+    .orderBy(sortDesc ? desc(orders.createdAt) : asc(orders.createdAt))
     .limit(limit);
 
   if (orderRows.length === 0) {
@@ -148,6 +168,8 @@ export async function GET(request: NextRequest) {
         count: 0,
         orders: [],
         nextSince: since ?? null,
+        nextBefore: null,
+        sort: sortDesc ? "desc" : "asc",
       },
       { headers: veloCorsHeaders(request) },
     );
@@ -211,7 +233,13 @@ export async function GET(request: NextRequest) {
       client: resolvedKey.clientName,
       count: data.length,
       orders: data,
+      // Asc sync cursor: newest row in this page.
       nextSince: orderRows[orderRows.length - 1].createdAt,
+      // Desc unpaid cursor: oldest row in this page (continue with before=).
+      nextBefore: sortDesc
+        ? orderRows[orderRows.length - 1].createdAt
+        : null,
+      sort: sortDesc ? "desc" : "asc",
     },
     { headers: veloCorsHeaders(request) },
   );
