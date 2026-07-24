@@ -16,7 +16,7 @@ import {
 } from "@/lib/supabase/schema";
 import { resolveProductImageUrls } from "./velo-product-images";
 import { keytoUrl, slugify } from "@/lib/utils";
-import { and, asc, desc, eq, ilike, inArray, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import sharp from "sharp";
 import { z } from "zod";
@@ -200,6 +200,47 @@ async function revalidateCollectionPages() {
   revalidatePath("/shop");
   revalidatePath("/admin/collections");
   await invalidateStorefrontCache();
+}
+
+/** Prefer newest product photo in the category when no category image is set. */
+async function findProductMediaForCollection(
+  collectionId: string,
+): Promise<string | null> {
+  const [row] = await db
+    .select({ featuredImageId: products.featuredImageId })
+    .from(products)
+    .where(
+      and(
+        eq(products.collectionId, collectionId),
+        isNotNull(products.featuredImageId),
+      ),
+    )
+    .orderBy(desc(products.createdAt))
+    .limit(1);
+  return row?.featuredImageId ?? null;
+}
+
+/** After a product upload, fill empty category image from that product photo. */
+async function backfillCollectionImageIfEmpty(
+  collectionId: string | null | undefined,
+  mediaId: string | null | undefined,
+) {
+  const cid = collectionId?.trim();
+  const mid = mediaId?.trim();
+  if (!cid || !mid) return;
+
+  const [col] = await db
+    .select({ featuredImageId: collections.featuredImageId })
+    .from(collections)
+    .where(eq(collections.id, cid))
+    .limit(1);
+  if (!col || col.featuredImageId) return;
+
+  await db
+    .update(collections)
+    .set({ featuredImageId: mid })
+    .where(eq(collections.id, cid));
+  await revalidateCollectionPages();
 }
 
 export type VeloProductsRequest = {
@@ -503,6 +544,7 @@ async function performUpsert(data: z.infer<typeof upsertDataSchema>) {
     await ensureProductMediaLink(updated.id, mediaId);
     await saveSizeConfig(updated.id, sizeConfig);
     await saveExternalProductMapping(data.externalProductId, updated.id);
+    await backfillCollectionImageIfEmpty(data.collectionId, mediaId);
 
     return {
       created: false,
@@ -542,6 +584,7 @@ async function performUpsert(data: z.infer<typeof upsertDataSchema>) {
   await ensureProductMediaLink(created.id, mediaId);
   await saveSizeConfig(created.id, sizeConfig);
   await saveExternalProductMapping(data.externalProductId, created.id);
+  await backfillCollectionImageIfEmpty(data.collectionId, mediaId);
 
   return {
     created: true,
@@ -990,9 +1033,15 @@ async function handleUpsertCollection(
   const description = parsed.data.description.trim();
   const existingId = parsed.data.id?.trim();
 
-  let featuredImageId: string;
+  let featuredImageId: string | null = null;
   try {
-    if (existingId && !parsed.data.imageBase64 && !parsed.data.featuredImageMediaId) {
+    if (parsed.data.featuredImageMediaId || parsed.data.imageBase64) {
+      featuredImageId = await resolveMediaId(
+        parsed.data.featuredImageMediaId,
+        parsed.data.imageBase64,
+        parsed.data.imageFileName || "category.jpg",
+      );
+    } else if (existingId) {
       const [existing] = await db
         .select({ featuredImageId: collections.featuredImageId })
         .from(collections)
@@ -1007,25 +1056,15 @@ async function handleUpsertCollection(
           errors: ["Category not found."],
         };
       }
-      featuredImageId = existing.featuredImageId;
-    } else if (!parsed.data.featuredImageMediaId && !parsed.data.imageBase64) {
-      return {
-        ok: false,
-        requestId,
-        action: "upsertCollection",
-        message: "Category image is required.",
-        errors: ["Category image is required."],
-      };
-    } else {
-      featuredImageId = await resolveMediaId(
-        parsed.data.featuredImageMediaId,
-        parsed.data.imageBase64,
-        parsed.data.imageFileName || "category.jpg",
-      );
+      featuredImageId =
+        existing.featuredImageId ??
+        (await findProductMediaForCollection(existingId));
     }
   } catch (error) {
     const message =
-      error instanceof Error ? error.message : "Category image is required.";
+      error instanceof Error
+        ? error.message
+        : "Could not process category image.";
     return {
       ok: false,
       requestId,
@@ -1064,11 +1103,13 @@ async function handleUpsertCollection(
       .where(eq(collections.id, existingId));
     await revalidateCollectionPages();
 
-    const [media] = await db
-      .select({ key: medias.key })
-      .from(medias)
-      .where(eq(medias.id, featuredImageId))
-      .limit(1);
+    const [media] = featuredImageId
+      ? await db
+          .select({ key: medias.key })
+          .from(medias)
+          .where(eq(medias.id, featuredImageId))
+          .limit(1)
+      : [null];
 
     return {
       ok: true,
@@ -1098,19 +1139,34 @@ async function handleUpsertCollection(
     })
     .returning({ id: collections.id });
 
+  if (!featuredImageId) {
+    const fromProduct = await findProductMediaForCollection(created.id);
+    if (fromProduct) {
+      featuredImageId = fromProduct;
+      await db
+        .update(collections)
+        .set({ featuredImageId: fromProduct })
+        .where(eq(collections.id, created.id));
+    }
+  }
+
   await revalidateCollectionPages();
 
-  const [media] = await db
-    .select({ key: medias.key })
-    .from(medias)
-    .where(eq(medias.id, featuredImageId))
-    .limit(1);
+  const [media] = featuredImageId
+    ? await db
+        .select({ key: medias.key })
+        .from(medias)
+        .where(eq(medias.id, featuredImageId))
+        .limit(1)
+    : [null];
 
   return {
     ok: true,
     requestId,
     action: "upsertCollection",
-    message: "Category created.",
+    message: featuredImageId
+      ? "Category created."
+      : "Category created. Image will use a product photo after you upload products to this category.",
     collection: {
       id: created.id,
       label: name,

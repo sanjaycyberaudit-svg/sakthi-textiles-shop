@@ -476,9 +476,9 @@ export const collections = pgTable(
     title: varchar("title", { length: 255 }).notNull(),
     description: varchar("description").notNull(),
     order: integer("order"),
-    featuredImageId: text("featured_image_id")
-      .notNull()
-      .references(() => medias.id, { onDelete: "restrict" }),
+    featuredImageId: text("featured_image_id").references(() => medias.id, {
+      onDelete: "set null",
+    }),
   },
   (table) => {
     return {
