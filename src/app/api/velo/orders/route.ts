@@ -8,11 +8,19 @@ import {
   resolveVeloApiKey,
   touchVeloApiKeyUsage,
 } from "@/lib/integrations/velo";
-import { and, asc, eq, gt, inArray, ne } from "drizzle-orm";
+import { and, asc, gt, inArray, ne, type SQL } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
+
+const ALLOWED_PAYMENT_STATUSES = [
+  "paid",
+  "unpaid",
+  "no_payment_required",
+] as const;
+
+type PaymentStatusFilter = (typeof ALLOWED_PAYMENT_STATUSES)[number];
 
 const VELO_CORS_ORIGINS = new Set([
   "https://software-saree-order.vercel.app",
@@ -69,6 +77,25 @@ export async function GET(request: NextRequest) {
     ? Math.min(Math.max(limitRaw, 1), MAX_LIMIT)
     : DEFAULT_LIMIT;
 
+  const paymentStatusRaw = searchParams.get("paymentStatus")?.trim().toLowerCase();
+  let paymentStatuses: PaymentStatusFilter[] = [...ALLOWED_PAYMENT_STATUSES];
+  if (paymentStatusRaw) {
+    if (
+      !ALLOWED_PAYMENT_STATUSES.includes(
+        paymentStatusRaw as PaymentStatusFilter,
+      )
+    ) {
+      return NextResponse.json(
+        {
+          message:
+            "Invalid `paymentStatus`. Use paid, unpaid, or no_payment_required.",
+        },
+        { status: 400, headers: veloCorsHeaders(request) },
+      );
+    }
+    paymentStatuses = [paymentStatusRaw as PaymentStatusFilter];
+  }
+
   let createdAfterDate: Date | null = null;
   if (since) {
     const parsed = new Date(since);
@@ -81,12 +108,8 @@ export async function GET(request: NextRequest) {
     createdAfterDate = parsed;
   }
 
-  // Include all valid payment statuses in schema, exclude cancelled orders.
-  const paymentFilter = inArray(orders.payment_status, [
-    "paid",
-    "unpaid",
-    "no_payment_required",
-  ]);
+  // Default: all valid payment statuses. Optional paymentStatus narrows the set.
+  const paymentFilter: SQL = inArray(orders.payment_status, paymentStatuses);
   const activeOrderFilter = ne(orders.order_status, "cancelled");
 
   const whereClause = createdAfterDate
