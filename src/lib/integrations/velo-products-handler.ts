@@ -152,7 +152,8 @@ export type VeloProductsAction =
   | "delete"
   | "meta"
   | "resolveImages"
-  | "upsertCollection";
+  | "upsertCollection"
+  | "deleteCollection";
 
 const resolveImagesDataSchema = z.object({
   productIds: z.array(z.string().trim().min(1)).min(1).max(100),
@@ -166,6 +167,13 @@ const upsertCollectionDataSchema = z.object({
   imageBase64: z.string().optional(),
   imageFileName: z.string().optional(),
 });
+
+const deleteCollectionDataSchema = z.object({
+  id: z.string().trim().min(1),
+  batchSize: z.number().int().min(1).max(10).optional(),
+});
+
+const CATEGORY_DELETE_BATCH_SIZE = 3;
 
 function collectionNameToSlug(name: string) {
   return slugify(name.trim()) || "category";
@@ -640,6 +648,9 @@ export async function handleVeloProductsRequest(
       case "upsertCollection":
         response = await handleUpsertCollection(requestId, body.data);
         break;
+      case "deleteCollection":
+        response = await handleDeleteCollection(requestId, body.data);
+        break;
       default:
         response = {
           ok: false,
@@ -660,7 +671,7 @@ export async function handleVeloProductsRequest(
     };
   }
 
-  if (response.ok && body.action !== "resolveImages") {
+  if (response.ok && body.action !== "resolveImages" && body.action !== "deleteCollection") {
     await saveIdempotentResponse(requestId, response);
   }
 
@@ -1176,6 +1187,143 @@ async function handleUpsertCollection(
       imageUrl: media?.key ? keytoUrl(media.key) : null,
     },
   };
+}
+
+/**
+ * Same end-state as website admin category delete: remove products (or unlink
+ * those with order history), then delete the category when none remain.
+ */
+async function deleteCategoryProductsBatchLocal(
+  collectionId: string,
+  batchSize = CATEGORY_DELETE_BATCH_SIZE,
+) {
+  const [collection] = await db
+    .select({ id: collections.id })
+    .from(collections)
+    .where(eq(collections.id, collectionId))
+    .limit(1);
+  if (!collection) return null;
+
+  const productRows = await db
+    .select({ id: products.id })
+    .from(products)
+    .where(eq(products.collectionId, collectionId));
+
+  const batchIds = productRows
+    .slice(0, Math.max(1, batchSize))
+    .map((row) => row.id);
+
+  const deletedIds: string[] = [];
+  const archivedIds: string[] = [];
+  const blocked: { id: string; reason: string }[] = [];
+
+  for (const productId of batchIds) {
+    const linked = await db
+      .select({ productId: orderLines.productId })
+      .from(orderLines)
+      .where(eq(orderLines.productId, productId))
+      .limit(1);
+    if (linked.length > 0) {
+      await db
+        .update(products)
+        .set({ collectionId: null })
+        .where(eq(products.id, productId));
+      archivedIds.push(productId);
+      continue;
+    }
+    try {
+      await db.delete(products).where(eq(products.id, productId));
+      deletedIds.push(productId);
+    } catch (error) {
+      blocked.push({
+        id: productId,
+        reason: error instanceof Error ? error.message : "Could not delete product.",
+      });
+    }
+  }
+
+  const [{ remaining }] = await db
+    .select({ remaining: sql<number>`count(*)::int` })
+    .from(products)
+    .where(eq(products.collectionId, collectionId));
+
+  const remainingCount = Number(remaining ?? 0);
+  let collectionDeleted = false;
+  if (remainingCount === 0) {
+    await db.delete(collections).where(eq(collections.id, collectionId));
+    collectionDeleted = true;
+  }
+
+  return {
+    deletedIds,
+    archivedIds,
+    blocked,
+    remaining: remainingCount,
+    done: collectionDeleted,
+    collectionDeleted,
+  };
+}
+
+async function handleDeleteCollection(
+  requestId: string,
+  data: Record<string, unknown>,
+): Promise<VeloProductsResponse> {
+  const parsed = deleteCollectionDataSchema.safeParse(data);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      requestId,
+      action: "deleteCollection",
+      message: "Category id is required.",
+      errors: ["Category id is required."],
+    };
+  }
+
+  try {
+    const outcome = await deleteCategoryProductsBatchLocal(
+      parsed.data.id,
+      parsed.data.batchSize,
+    );
+    if (!outcome) {
+      return {
+        ok: false,
+        requestId,
+        action: "deleteCollection",
+        message: "Category not found.",
+        errors: ["Category not found."],
+      };
+    }
+
+    if (outcome.done) {
+      await revalidateCollectionPages();
+    }
+
+    return {
+      ok: true,
+      requestId,
+      action: "deleteCollection",
+      message: outcome.done
+        ? "Category deleted."
+        : `Category delete in progress (${outcome.remaining} product(s) remaining).`,
+      deletedId: parsed.data.id,
+      deletedIds: outcome.deletedIds,
+      archivedIds: outcome.archivedIds,
+      blocked: outcome.blocked,
+      remaining: outcome.remaining,
+      done: outcome.done,
+      collectionDeleted: outcome.collectionDeleted,
+    };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to delete category.";
+    return {
+      ok: false,
+      requestId,
+      action: "deleteCollection",
+      message,
+      errors: [message],
+    };
+  }
 }
 
 /** Batch-resolve packing photos by shop product ids (draft + published). */
